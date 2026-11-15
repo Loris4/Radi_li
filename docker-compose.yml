@@ -1,0 +1,70 @@
+# Radi li? – korak 1: infrastruktura i testni servisi
+#
+# Pokretanje:   docker compose up --build
+# Gašenje:      docker compose down
+# Brisanje baze i redova: docker compose down -v
+
+services:
+
+  # Red poruka. Na http://localhost:15672 je web-sučelje (korisnik/lozinka iz .env).
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    ports:
+      - "5672:5672"     # AMQP – preko ovoga razgovaraju naše usluge
+      - "15672:15672"   # web-sučelje za upravljanje
+    volumes:
+      - rabbitmq_podaci:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Baza za servise, rezultate provjera i incidente.
+  baza:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - baza_podaci:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Testni servisi: "lažni" e-Građani, Studomat i Merlin koje možemo
+  # po volji ugasiti ili usporiti. Na njima testiramo cijeli sustav,
+  # da ne opterećujemo prave javne servise.
+  testni-egradani:
+    build: ./testni-servis
+    environment:
+      IME_SERVISA: e-Građani (testni)
+    ports:
+      - "8101:8000"
+
+  testni-studomat:
+    build: ./testni-servis
+    environment:
+      IME_SERVISA: Studomat (testni)
+    ports:
+      - "8102:8000"
+
+  testni-merlin:
+    build: ./testni-servis
+    environment:
+      IME_SERVISA: Merlin (testni)
+    ports:
+      - "8103:8000"
+
+volumes:
+  rabbitmq_podaci:
+  baza_podaci:
