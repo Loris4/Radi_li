@@ -5,8 +5,10 @@ Svaka sonda glumi jednu lokaciju (npr. Pula, Rijeka, Zagreb). Ne zna ništa
 o bazi ni o drugim sondama: samo provjerava i objavljuje. O tome je li
 servis stvarno pao odlučuje kasnije detektor ispada (kvorum 2 od 3).
 
-U ovom koraku popis servisa dolazi iz varijable okruženja SERVISI.
-U koraku 5 popis će slati raspoređivač.
+U ovom koraku sonda popis aktivnih servisa svakih OSVJEZI_S sekundi
+dohvaća od usluge konfiguracije (REST). Ako konfiguracija ne odgovara,
+sonda nastavlja s posljednjim poznatim popisom.
+U koraku 5 popis će umjesto toga slati raspoređivač.
 """
 
 import asyncio
@@ -25,22 +27,15 @@ import httpx
 SONDA_ID = os.environ["SONDA_ID"]
 LOKACIJA = os.getenv("LOKACIJA", "nepoznato")
 RABBITMQ_URL = os.environ["RABBITMQ_URL"]
-INTERVAL_S = float(os.getenv("INTERVAL_S", "30"))   # koliko često provjeravamo
-ISTEK_S = float(os.getenv("ISTEK_S", "10"))         # timeout jedne provjere
-SERVISI = json.loads(os.environ["SERVISI"])         # [{"id", "naziv", "url"}, ...]
+KONFIGURACIJA_URL = os.environ["KONFIGURACIJA_URL"]
+TAKT_S = float(os.getenv("TAKT_S", "1"))           # koliko često sonda gleda kome je došao red
+ISTEK_S = float(os.getenv("ISTEK_S", "10"))        # timeout jedne provjere
+OSVJEZI_S = float(os.getenv("OSVJEZI_S", "30"))    # koliko često osvježava popis servisa
 
-if ISTEK_S >= INTERVAL_S:
-    raise SystemExit("ISTEK_S mora biti manji od INTERVAL_S, inače se krugovi provjera preklapaju")
-
-# Rezultati se objavljuju na fanout exchange (objavi–pretplati se):
-# svaka usluga koja ih treba (prihvat, detektor ispada) dobiva svoju kopiju.
 EXCHANGE_REZULTATI = "rezultati"
-# Red iz kojega će usluga za prihvat (korak 3) čitati rezultate.
-# Deklariramo ga i ovdje da se rezultati ne gube dok prihvat još ne postoji.
-# Deklaracija je idempotentna: ako red već postoji, ništa se ne mijenja.
 RED_PRIHVAT = "rezultati.prihvat"
 
-KORISNICKI_AGENT = "RadiLi-sonda/0.1 (studentski projekt, FIPU)"
+KORISNICKI_AGENT = "RadiLi-sonda/0.2 (studentski projekt, FIPU)"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,17 +44,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("sonda")
 
+# Stanje sonde – samo lokalno, ništa od ovoga nije zajedničko s drugima
+servisi: dict[str, dict] = {}          # servis_id -> {"id", "naziv", "url", "interval_s", ...}
+zadnja_provjera: dict[str, float] = {}  # servis_id -> monotonic vrijeme zadnje provjere
+u_tijeku: set[str] = set()             # servisi čija provjera još traje
+
+
+# --- Popis servisa ---------------------------------------------------------------
+
+async def osvjezi_popis(klijent: httpx.AsyncClient) -> bool:
+    """Dohvati aktivne servise od konfiguracije. Vraća True ako je uspjelo."""
+    try:
+        odgovor = await klijent.get(
+            f"{KONFIGURACIJA_URL}/servisi", params={"aktivan": "true"}, timeout=3
+        )
+        odgovor.raise_for_status()
+        novi = {s["id"]: s for s in odgovor.json()}
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("Konfiguracija nedostupna (%s), nastavljam s posljednjim popisom (%d servisa)",
+                    type(e).__name__, len(servisi))
+        return False
+
+    if set(novi) != set(servisi):
+        log.info("Popis servisa: %s", ", ".join(sorted(novi)) or "(prazan)")
+    servisi.clear()
+    servisi.update(novi)
+    return True
+
+
+async def popis_petlja(klijent: httpx.AsyncClient, stop: asyncio.Event):
+    while not stop.is_set():
+        await osvjezi_popis(klijent)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=OSVJEZI_S)
+        except asyncio.TimeoutError:
+            pass
+
 
 # --- Provjera jednog servisa -----------------------------------------------
 
-async def provjeri(klijent: httpx.AsyncClient, servis: dict, krug: datetime) -> dict:
+async def provjeri(klijent: httpx.AsyncClient, servis: dict) -> dict:
     """Pošalje GET na servis i vrati rezultat. Nikad ne baca iznimku."""
+    krug = datetime.now(timezone.utc).replace(microsecond=0)
     pocetak = time.perf_counter()
     http_status = None
     greska = None
 
     try:
-        odgovor = await klijent.get(servis["url"])
+        odgovor = await klijent.get(servis["url"], timeout=ISTEK_S)
         http_status = odgovor.status_code
         uspjeh = 200 <= http_status < 400
         if not uspjeh:
@@ -75,7 +107,7 @@ async def provjeri(klijent: httpx.AsyncClient, servis: dict, krug: datetime) -> 
     odziv_ms = round((time.perf_counter() - pocetak) * 1000)
 
     return {
-        # Jedinstveni ključ provjere: ista sonda, isti servis, isti krug.
+        # Jedinstveni ključ provjere: ista sonda, isti servis, isti trenutak.
         # Usluga za prihvat po njemu prepoznaje duplikate (idempotentnost).
         "provjera_id": f"{SONDA_ID}:{servis['id']}:{int(krug.timestamp())}",
         "sonda_id": SONDA_ID,
@@ -90,6 +122,28 @@ async def provjeri(klijent: httpx.AsyncClient, servis: dict, krug: datetime) -> 
     }
 
 
+async def provjeri_i_objavi(klijent, exchange, servis: dict):
+    try:
+        r = await provjeri(klijent, servis)
+        ispisi(servis, r)
+        try:
+            await exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(r).encode(),
+                    content_type="application/json",
+                    message_id=r["provjera_id"],
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                ),
+                routing_key="",
+            )
+        except Exception as e:
+            # Veza je pukla; connect_robust je obnavlja u pozadini.
+            # Ovaj rezultat se gubi, sljedeća provjera ide normalno.
+            log.error("Objava nije uspjela: %s", e)
+    finally:
+        u_tijeku.discard(servis["id"])
+
+
 # --- Spajanje na RabbitMQ ----------------------------------------------------
 
 async def povezi_rabbitmq() -> aio_pika.abc.AbstractRobustConnection:
@@ -97,7 +151,6 @@ async def povezi_rabbitmq() -> aio_pika.abc.AbstractRobustConnection:
     cekanje = 1
     while True:
         try:
-            # connect_robust se sam ponovno spaja ako veza kasnije pukne
             return await aio_pika.connect_robust(RABBITMQ_URL)
         except Exception as e:
             log.warning("RabbitMQ nije dostupan (%s), novi pokušaj za %s s", e, cekanje)
@@ -122,55 +175,45 @@ async def main():
     red = await kanal.declare_queue(RED_PRIHVAT, durable=True)
     await red.bind(exchange)
 
-    log.info("Pokrenuta. Provjeravam %d servisa svakih %.0f s.", len(SERVISI), INTERVAL_S)
-
     async with httpx.AsyncClient(
-        timeout=ISTEK_S,
         headers={"User-Agent": KORISNICKI_AGENT},
         follow_redirects=True,
     ) as klijent:
-        sljedeci_krug = time.monotonic()
+        # Prvi popis: čekamo dok ga ne dobijemo (bez njega nemamo što provjeravati)
+        while not stop.is_set() and not await osvjezi_popis(klijent):
+            await asyncio.sleep(3)
+
+        log.info("Pokrenuta.")
+        zadaci = {asyncio.create_task(popis_petlja(klijent, stop))}
 
         while not stop.is_set():
-            krug = datetime.now(timezone.utc).replace(microsecond=0)
-
-            # Svi servisi provjeravaju se istovremeno: spor servis
-            # ne zadržava provjere ostalih.
-            rezultati = await asyncio.gather(
-                *(provjeri(klijent, s, krug) for s in SERVISI)
-            )
-
-            for r in rezultati:
-                ispisi(r)
-                try:
-                    await exchange.publish(
-                        aio_pika.Message(
-                            body=json.dumps(r).encode(),
-                            content_type="application/json",
-                            message_id=r["provjera_id"],
-                            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                        ),
-                        routing_key="",
-                    )
-                except Exception as e:
-                    # Veza je pukla; connect_robust je obnavlja u pozadini.
-                    # Ovaj rezultat se gubi, sljedeći krug ide normalno.
-                    log.error("Objava nije uspjela: %s", e)
-
-            # Fiksni ritam: krugovi počinju svakih INTERVAL_S sekundi,
-            # bez obzira na to koliko je trajala sama provjera.
-            sljedeci_krug += INTERVAL_S
+            sada = time.monotonic()
+            for servis in list(servisi.values()):
+                sid = servis["id"]
+                dosao_red = sada - zadnja_provjera.get(sid, 0) >= servis["interval_s"]
+                # Ako prethodna provjera istog servisa još traje (spor servis),
+                # ne pokrećemo novu – ne želimo ga dodatno opterećivati.
+                if dosao_red and sid not in u_tijeku:
+                    zadnja_provjera[sid] = sada
+                    u_tijeku.add(sid)
+                    # Svaka provjera je zaseban zadatak: spor servis
+                    # ne zadržava provjere ostalih.
+                    z = asyncio.create_task(provjeri_i_objavi(klijent, exchange, servis))
+                    zadaci.add(z)
+                    z.add_done_callback(zadaci.discard)
             try:
-                await asyncio.wait_for(stop.wait(), timeout=max(0, sljedeci_krug - time.monotonic()))
+                await asyncio.wait_for(stop.wait(), timeout=TAKT_S)
             except asyncio.TimeoutError:
                 pass
 
-    log.info("Zaustavljam se.")
+        log.info("Zaustavljam se.")
+        for z in zadaci:
+            z.cancel()
     await veza.close()
 
 
-def ispisi(r: dict):
-    naziv = next((s["naziv"] for s in SERVISI if s["id"] == r["servis_id"]), r["servis_id"])
+def ispisi(servis: dict, r: dict):
+    naziv = servis.get("naziv", r["servis_id"])
     if r["uspjeh"]:
         log.info("%-22s OK    %s  %5d ms", naziv, r["http_status"], r["odziv_ms"])
     else:

@@ -11,15 +11,29 @@ Radi_li/
 ├── docker-compose.yml   # sve komponente i infrastruktura
 ├── .env.example         # predložak postavki (kopirati u .env)
 ├── testni-servis/       # lažni javni servis za testiranje (može se ugasiti/usporiti)
+├── konfiguracija/       # vlasnik popisa servisa (REST, PostgreSQL)
 ├── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
 └── prihvat/             # čita rezultate iz reda i sprema ih u PostgreSQL
 ```
 
-Ostale komponente (konfiguracija, raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+Ostale komponente (raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+
+## Usluga konfiguracije
+
+Jedini pisac tablice `servisi`. Sučelje za isprobavanje: http://localhost:8301/docs
+
+| Zahtjev | Opis |
+| --- | --- |
+| `GET /servisi?aktivan=true` | popis servisa (ovo čitaju sonde) |
+| `PUT /servisi/{id}` | dodaje ili zamjenjuje servis (idempotentno) |
+| `PATCH /servisi/{id}` | djelomična izmjena, npr. `{"aktivan": false}` |
+| `DELETE /servisi/{id}` | briše servis (idempotentno) |
+
+Pravilo odgovornog praćenja: stvarni javni servisi (`testni: false`) imaju interval od najmanje 60 s, testni od najmanje 10 s. Pravilo provjeravaju i usluga i baza. Stvarni javni servisi (gov.hr, Studomat, Merlin, FIPU) upisani su kao isključeni dok ih operater ne uključi.
 
 ## Sonde
 
-Tri sonde (`sonda-a` Pula, `sonda-b` Rijeka, `sonda-c` Zagreb) svakih 10 s provjeravaju testne servise i rezultate objavljuju na fanout exchange `rezultati`. Odatle idu u red `rezultati.prihvat`, iz kojega će čitati usluga za prihvat.
+Tri sonde (`sonda-a` Pula, `sonda-b` Rijeka, `sonda-c` Zagreb) svakih 15 s dohvaćaju popis aktivnih servisa od usluge konfiguracije, provjeravaju svaki servis prema njegovom intervalu i rezultate objavljuju na fanout exchange `rezultati`. Odatle idu u red `rezultati.prihvat`, iz kojega će čitati usluga za prihvat.
 
 Svaki rezultat je JSON poruka:
 
@@ -50,8 +64,10 @@ Svaki rezultat je JSON poruka:
 
 | Zahtjev | Opis |
 | --- | --- |
-| `GET http://localhost:8201/zdravlje` | je li replika spojena na bazu i RabbitMQ |
-| `GET http://localhost:8201/statistika` | koliko je poruka primila, upisala, prepoznala kao duplikat ili odbacila |
+| `GET /zdravlje` | je li replika spojena na bazu i RabbitMQ |
+| `GET /statistika` | koliko je poruka primila, upisala, prepoznala kao duplikat ili odbacila |
+
+Docker svakoj replici sam dodjeljuje port na računalu. Portove vidiš naredbom `docker compose ps prihvat` (stupac PORTS, npr. `0.0.0.0:55012->8000/tcp` znači http://localhost:55012/statistika).
 
 Pregled zadnjih rezultata u bazi:
 

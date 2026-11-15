@@ -1,4 +1,4 @@
-# Radi li? – korak 3: infrastruktura, testni servisi, sonde i usluga za prihvat
+# Radi li? – korak 4: infrastruktura, testni servisi, sonde, prihvat i konfiguracija
 #
 # Pokretanje:   docker compose up --build
 # Gašenje:      docker compose down
@@ -12,19 +12,29 @@ x-sonda: &sonda
   depends_on:
     rabbitmq:
       condition: service_healthy
+    konfiguracija:
+      condition: service_started
   environment: &sonda-env
     RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
-    INTERVAL_S: "10"   # za razvoj 10 s da brže vidimo promjene; u prijavi je 30 s
+    # Popis servisa i interval svakog servisa dolaze iz usluge konfiguracije.
+    # (U koraku 5 popis će slati raspoređivač.)
+    KONFIGURACIJA_URL: http://konfiguracija:8000
     ISTEK_S: "5"
-    # Za sada samo testni servisi. Popis će u koraku 5 slati raspoređivač.
-    SERVISI: >-
-      [
-        {"id": "egradani", "naziv": "e-Građani (testni)", "url": "http://testni-egradani:8000/"},
-        {"id": "studomat", "naziv": "Studomat (testni)",  "url": "http://testni-studomat:8000/"},
-        {"id": "merlin",   "naziv": "Merlin (testni)",    "url": "http://testni-merlin:8000/"}
-      ]
+    OSVJEZI_S: "15"
 
 services:
+
+  # Vlasnik popisa servisa. Sučelje za ručno isprobavanje: http://localhost:8301/docs
+  konfiguracija:
+    build: ./konfiguracija
+    restart: unless-stopped
+    depends_on:
+      baza:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@baza:5432/${POSTGRES_DB}
+    ports:
+      - "8301:8000"
 
   sonda-a:
     <<: *sonda
@@ -50,7 +60,8 @@ services:
   # Čita rezultate iz reda rezultati.prihvat i sprema ih u bazu.
   # Nema vlastito stanje, pa se može skalirati:
   #   docker compose up -d --scale prihvat=3
-  # Raspon portova omogućuje da svaka replika dobije svoj port (8201, 8202, ...).
+  # Port na računalu Docker svakoj replici dodjeljuje sam (slobodan port).
+  # Koji je to port, vidi se naredbom: docker compose ps prihvat
   prihvat:
     build: ./prihvat
     restart: unless-stopped
