@@ -11,10 +11,11 @@ Radi_li/
 ├── docker-compose.yml   # sve komponente i infrastruktura
 ├── .env.example         # predložak postavki (kopirati u .env)
 ├── testni-servis/       # lažni javni servis za testiranje (može se ugasiti/usporiti)
-└── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
+├── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
+└── prihvat/             # čita rezultate iz reda i sprema ih u PostgreSQL
 ```
 
-Ostale komponente (usluga za prihvat, raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+Ostale komponente (konfiguracija, raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
 
 ## Sonde
 
@@ -38,6 +39,25 @@ Svaki rezultat je JSON poruka:
 ```
 
 `provjera_id` je jedinstven za sondu, servis i krug provjere, pa se po njemu prepoznaju duplikati.
+
+## Usluga za prihvat
+
+Čita red `rezultati.prihvat` i upisuje rezultate u tablicu `rezultati` (particioniranu po danu), u serijama do 100 rezultata ili svake sekunde.
+
+- Poruka se potvrđuje (ack) tek nakon upisa u bazu, pa se pri padu usluge ništa ne gubi.
+- Upis je idempotentan (`ON CONFLICT DO NOTHING` po `provjera_id`), pa ponovno isporučena poruka ne stvara duplikat.
+- Nema vlastito stanje i skalira se horizontalno: `docker compose up -d --scale prihvat=3`.
+
+| Zahtjev | Opis |
+| --- | --- |
+| `GET http://localhost:8201/zdravlje` | je li replika spojena na bazu i RabbitMQ |
+| `GET http://localhost:8201/statistika` | koliko je poruka primila, upisala, prepoznala kao duplikat ili odbacila |
+
+Pregled zadnjih rezultata u bazi:
+
+```
+docker compose exec baza psql -U radili -c "SELECT sonda_id, servis_id, vrijeme, uspjeh, greska FROM rezultati ORDER BY vrijeme DESC LIMIT 9;"
+```
 
 ## Pokretanje
 

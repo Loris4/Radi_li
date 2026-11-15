@@ -1,4 +1,4 @@
-# Radi li? – korak 2: infrastruktura, testni servisi i sonde
+# Radi li? – korak 3: infrastruktura, testni servisi, sonde i usluga za prihvat
 #
 # Pokretanje:   docker compose up --build
 # Gašenje:      docker compose down
@@ -46,6 +46,24 @@ services:
       <<: *sonda-env
       SONDA_ID: sonda-c
       LOKACIJA: Zagreb
+
+  # Čita rezultate iz reda rezultati.prihvat i sprema ih u bazu.
+  # Nema vlastito stanje, pa se može skalirati:
+  #   docker compose up -d --scale prihvat=3
+  # Raspon portova omogućuje da svaka replika dobije svoj port (8201, 8202, ...).
+  prihvat:
+    build: ./prihvat
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      baza:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@baza:5432/${POSTGRES_DB}
+    ports:
+      - "8201-8204:8000"
 
 
   # Red poruka. Na http://localhost:15672 je web-sučelje (korisnik/lozinka iz .env).
