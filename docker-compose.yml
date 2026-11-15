@@ -63,7 +63,7 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@baza:5432/${POSTGRES_DB}
     ports:
-      - "8201-8204:8000"
+      - "8000"
 
 
   # Red poruka. Na http://localhost:15672 je web-sučelje (korisnik/lozinka iz .env).
