@@ -40,6 +40,7 @@ RABBITMQ_URL = os.environ["RABBITMQ_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 VELICINA_SERIJE = int(os.getenv("VELICINA_SERIJE", "100"))
 MAX_CEKANJE_SERIJE_S = float(os.getenv("MAX_CEKANJE_SERIJE_S", "1"))
+SAZETAK_S = int(os.getenv("SAZETAK_S", "60"))      # koliko često ispisati sažetak u log
 
 # Isto kao u sondi. Deklaracije su idempotentne, pa nije bitno tko ih prvi napravi.
 EXCHANGE_REZULTATI = "rezultati"
@@ -50,7 +51,7 @@ INSTANCA = socket.gethostname()
 
 logging.basicConfig(
     level=logging.INFO,
-    format=f"%(asctime)s [prihvat/{INSTANCA[:12]}] %(message)s",
+    format=f"%(asctime)s %(levelname)-7s [prihvat/{INSTANCA[:12]}] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("prihvat")
@@ -226,6 +227,19 @@ async def obradi_seriju(pool: asyncpg.Pool, serija: list):
     log.info("Upisano %d novih rezultata (%d duplikata)", novih, len(zapisi) - novih)
 
 
+async def sazetak_petlja():
+    """Jednom u minuti ispiše sažetak (filtrira se sa: Select-String "SAZETAK")."""
+    prije = dict(statistika)
+    while True:
+        await asyncio.sleep(SAZETAK_S)
+        upisano = statistika["upisano"] - prije["upisano"]
+        duplikata = statistika["duplikata"] - prije["duplikata"]
+        odbaceno = statistika["odbaceno"] - prije["odbaceno"]
+        log.info("SAZETAK zadnjih %d s: upisano %d, duplikata %d, odbačeno %d",
+                 SAZETAK_S, upisano, duplikata, odbaceno)
+        prije = dict(statistika)
+
+
 async def radnik(pool: asyncpg.Pool, ulaz: asyncio.Queue):
     """Skuplja poruke u serije: do VELICINA_SERIJE ili MAX_CEKANJE_SERIJE_S."""
     petlja = asyncio.get_running_loop()
@@ -291,6 +305,7 @@ async def lifespan(app: FastAPI):
     stanje["zadaci"] = [
         asyncio.create_task(radnik(pool, ulaz)),
         asyncio.create_task(particije_petlja(pool)),
+        asyncio.create_task(sazetak_petlja()),
     ]
     log.info("Pokrenuta, čitam iz reda %s", RED_PRIHVAT)
 

@@ -39,7 +39,7 @@ KORISNICKI_AGENT = "RadiLi-sonda/0.2 (studentski projekt, FIPU)"
 
 logging.basicConfig(
     level=logging.INFO,
-    format=f"%(asctime)s [{SONDA_ID}/{LOKACIJA}] %(message)s",
+    format=f"%(asctime)s %(levelname)-7s [{SONDA_ID}/{LOKACIJA}] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("sonda")
@@ -48,6 +48,7 @@ log = logging.getLogger("sonda")
 servisi: dict[str, dict] = {}          # servis_id -> {"id", "naziv", "url", "interval_s", ...}
 zadnja_provjera: dict[str, float] = {}  # servis_id -> monotonic vrijeme zadnje provjere
 u_tijeku: set[str] = set()             # servisi čija provjera još traje
+zadnje_stanje: dict[str, bool] = {}    # servis_id -> je li zadnja provjera uspjela (za oznaku PROMJENA)
 
 
 # --- Popis servisa ---------------------------------------------------------------
@@ -213,11 +214,22 @@ async def main():
 
 
 def ispisi(servis: dict, r: dict):
-    naziv = servis.get("naziv", r["servis_id"])
+    """
+    Zapisuje SVAKU provjeru. Filtriranje se radi u terminalu, npr.:
+      docker compose logs -f sonda-a | Select-String "PROMJENA"
+    Uspjela provjera ide na razini INFO, neuspjela na razini WARNING.
+    Kad se stanje servisa promijeni (pad ili povratak), redak počinje s PROMJENA.
+    """
+    sid = r["servis_id"]
+    prethodno = zadnje_stanje.get(sid)
+    zadnje_stanje[sid] = r["uspjeh"]
+    promjena = "PROMJENA " if prethodno is not None and prethodno != r["uspjeh"] else ""
+
+    naziv = servis.get("naziv", sid)
     if r["uspjeh"]:
-        log.info("%-22s OK    %s  %5d ms", naziv, r["http_status"], r["odziv_ms"])
+        log.info("%s%-22s RADI     %s  %5d ms", promjena, naziv, r["http_status"], r["odziv_ms"])
     else:
-        log.info("%-22s PAO   %s  %5d ms", naziv, r["greska"], r["odziv_ms"])
+        log.warning("%s%-22s NE RADI  %s  %5d ms", promjena, naziv, r["greska"], r["odziv_ms"])
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [konfiguracija] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s [konfiguracija] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("konfiguracija")
 
 ID_UZORAK = r"^[a-z0-9-]{2,40}$"
