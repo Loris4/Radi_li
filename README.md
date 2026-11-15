@@ -10,10 +10,34 @@ Projekt iz kolegija Raspodijeljeni sustavi, FIPU. Autor: Loris Lukić.
 Radi_li/
 ├── docker-compose.yml   # sve komponente i infrastruktura
 ├── .env.example         # predložak postavki (kopirati u .env)
-└── testni-servis/       # lažni javni servis za testiranje (može se ugasiti/usporiti)
+├── testni-servis/       # lažni javni servis za testiranje (može se ugasiti/usporiti)
+└── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
 ```
 
-Ostale komponente (sonde, usluga za prihvat, raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+Ostale komponente (usluga za prihvat, raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+
+## Sonde
+
+Tri sonde (`sonda-a` Pula, `sonda-b` Rijeka, `sonda-c` Zagreb) svakih 10 s provjeravaju testne servise i rezultate objavljuju na fanout exchange `rezultati`. Odatle idu u red `rezultati.prihvat`, iz kojega će čitati usluga za prihvat.
+
+Svaki rezultat je JSON poruka:
+
+```json
+{
+  "provjera_id": "sonda-a:egradani:1763208000",
+  "sonda_id": "sonda-a",
+  "lokacija": "Pula",
+  "servis_id": "egradani",
+  "url": "http://testni-egradani:8000/",
+  "vrijeme": "2026-11-15T12:00:00+00:00",
+  "uspjeh": true,
+  "http_status": 200,
+  "odziv_ms": 12,
+  "greska": null
+}
+```
+
+`provjera_id` je jedinstven za sondu, servis i krug provjere, pa se po njemu prepoznaju duplikati.
 
 ## Pokretanje
 

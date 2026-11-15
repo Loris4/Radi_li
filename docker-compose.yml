@@ -1,10 +1,52 @@
-# Radi li? – korak 1: infrastruktura i testni servisi
+# Radi li? – korak 2: infrastruktura, testni servisi i sonde
 #
 # Pokretanje:   docker compose up --build
 # Gašenje:      docker compose down
 # Brisanje baze i redova: docker compose down -v
 
+# Zajedničke postavke svih sondi (YAML sidro, da se ne ponavljamo).
+# Svaka sonda glumi drugu lokaciju; razlikuju se samo SONDA_ID i LOKACIJA.
+x-sonda: &sonda
+  build: ./sonda
+  restart: unless-stopped
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+  environment: &sonda-env
+    RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+    INTERVAL_S: "10"   # za razvoj 10 s da brže vidimo promjene; u prijavi je 30 s
+    ISTEK_S: "5"
+    # Za sada samo testni servisi. Popis će u koraku 5 slati raspoređivač.
+    SERVISI: >-
+      [
+        {"id": "egradani", "naziv": "e-Građani (testni)", "url": "http://testni-egradani:8000/"},
+        {"id": "studomat", "naziv": "Studomat (testni)",  "url": "http://testni-studomat:8000/"},
+        {"id": "merlin",   "naziv": "Merlin (testni)",    "url": "http://testni-merlin:8000/"}
+      ]
+
 services:
+
+  sonda-a:
+    <<: *sonda
+    environment:
+      <<: *sonda-env
+      SONDA_ID: sonda-a
+      LOKACIJA: Pula
+
+  sonda-b:
+    <<: *sonda
+    environment:
+      <<: *sonda-env
+      SONDA_ID: sonda-b
+      LOKACIJA: Rijeka
+
+  sonda-c:
+    <<: *sonda
+    environment:
+      <<: *sonda-env
+      SONDA_ID: sonda-c
+      LOKACIJA: Zagreb
+
 
   # Red poruka. Na http://localhost:15672 je web-sučelje (korisnik/lozinka iz .env).
   rabbitmq:
