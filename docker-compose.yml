@@ -1,8 +1,9 @@
-# Radi li? – korak 4: infrastruktura, testni servisi, sonde, prihvat i konfiguracija
+# Radi li? – korak 5: + raspoređivač i otkucaji sondi
 #
-# Pokretanje:   docker compose up --build
+# Pokretanje:   docker compose up -d --build
 # Gašenje:      docker compose down
 # Brisanje baze i redova: docker compose down -v
+# Dodatna sonda (Osijek) za demonstraciju: docker compose --profile dodatne up -d sonda-d
 
 # Zajedničke postavke svih sondi (YAML sidro, da se ne ponavljamo).
 # Svaka sonda glumi drugu lokaciju; razlikuju se samo SONDA_ID i LOKACIJA.
@@ -12,17 +13,34 @@ x-sonda: &sonda
   depends_on:
     rabbitmq:
       condition: service_healthy
-    konfiguracija:
-      condition: service_started
   environment: &sonda-env
     RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
-    # Popis servisa i interval svakog servisa dolaze iz usluge konfiguracije.
-    # (U koraku 5 popis će slati raspoređivač.)
-    KONFIGURACIJA_URL: http://konfiguracija:8000
+    # Popis servisa sonda dobiva od raspoređivača (kroz RabbitMQ).
     ISTEK_S: "5"
-    OSVJEZI_S: "15"
+    OTKUCAJ_S: "10"
 
 services:
+
+  # Prati otkucaje sondi i dodjeljuje svaki servis trima sondama.
+  # Stanje sondi: http://localhost:8401/sonde   Raspored: http://localhost:8401/raspored
+  # Radi kao JEDNA instanca (bez --scale); ako padne, sonde nastavljaju po starom rasporedu.
+  rasporedivac:
+    build: ./rasporedivac
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      baza:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@baza:5432/${POSTGRES_DB}
+      KONFIGURACIJA_URL: http://konfiguracija:8000
+      OTKUCAJ_S: "10"
+      KASNI_S: "15"
+      ISPALA_S: "30"
+    ports:
+      - "8401:8000"
 
   # Vlasnik popisa servisa. Sučelje za ručno isprobavanje: http://localhost:8301/docs
   konfiguracija:
@@ -56,6 +74,16 @@ services:
       <<: *sonda-env
       SONDA_ID: sonda-c
       LOKACIJA: Zagreb
+
+  # Ne pokreće se sama; služi za demonstraciju dolaska nove sonde:
+  #   docker compose --profile dodatne up -d sonda-d
+  sonda-d:
+    <<: *sonda
+    profiles: ["dodatne"]
+    environment:
+      <<: *sonda-env
+      SONDA_ID: sonda-d
+      LOKACIJA: Osijek
 
   # Čita rezultate iz reda rezultati.prihvat i sprema ih u bazu.
   # Nema vlastito stanje, pa se može skalirati:

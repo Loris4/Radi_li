@@ -5,10 +5,14 @@ Svaka sonda glumi jednu lokaciju (npr. Pula, Rijeka, Zagreb). Ne zna ništa
 o bazi ni o drugim sondama: samo provjerava i objavljuje. O tome je li
 servis stvarno pao odlučuje kasnije detektor ispada (kvorum 2 od 3).
 
-U ovom koraku sonda popis aktivnih servisa svakih OSVJEZI_S sekundi
-dohvaća od usluge konfiguracije (REST). Ako konfiguracija ne odgovara,
-sonda nastavlja s posljednjim poznatim popisom.
-U koraku 5 popis će umjesto toga slati raspoređivač.
+Komunikacija sonde (sve asinkrono, kroz RabbitMQ):
+  - svakih OTKUCAJ_S sekundi šalje otkucaj (heartbeat) u red "otkucaji",
+    da raspoređivač zna da je živa;
+  - iz svog reda "raspored.<SONDA_ID>" prima popis servisa koje provjerava;
+  - rezultate objavljuje na fanout exchange "rezultati".
+
+Ako raspoređivač ne radi, sonda nastavlja po posljednjem primljenom
+rasporedu – praćenje ne staje.
 """
 
 import asyncio
@@ -16,6 +20,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import time
 from datetime import datetime, timezone
 
@@ -27,15 +32,21 @@ import httpx
 SONDA_ID = os.environ["SONDA_ID"]
 LOKACIJA = os.getenv("LOKACIJA", "nepoznato")
 RABBITMQ_URL = os.environ["RABBITMQ_URL"]
-KONFIGURACIJA_URL = os.environ["KONFIGURACIJA_URL"]
 TAKT_S = float(os.getenv("TAKT_S", "1"))           # koliko često sonda gleda kome je došao red
 ISTEK_S = float(os.getenv("ISTEK_S", "10"))        # timeout jedne provjere
-OSVJEZI_S = float(os.getenv("OSVJEZI_S", "30"))    # koliko često osvježava popis servisa
+OTKUCAJ_S = float(os.getenv("OTKUCAJ_S", "10"))    # koliko često šalje otkucaj
 
 EXCHANGE_REZULTATI = "rezultati"
 RED_PRIHVAT = "rezultati.prihvat"
+RED_OTKUCAJI = "otkucaji"
+EXCHANGE_RASPORED = "raspored"
+RED_RASPORED = f"raspored.{SONDA_ID}"
 
-KORISNICKI_AGENT = "RadiLi-sonda/0.2 (studentski projekt, FIPU)"
+# Svako pokretanje kontejnera je nova instanca; raspoređivač po tome
+# prepoznaje da je sonda ponovno pokrenuta.
+INSTANCA = f"{socket.gethostname()}-{int(time.time())}"
+
+KORISNICKI_AGENT = "RadiLi-sonda/0.3 (studentski projekt, FIPU)"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,35 +60,63 @@ servisi: dict[str, dict] = {}          # servis_id -> {"id", "naziv", "url", "in
 zadnja_provjera: dict[str, float] = {}  # servis_id -> monotonic vrijeme zadnje provjere
 u_tijeku: set[str] = set()             # servisi čija provjera još traje
 zadnje_stanje: dict[str, bool] = {}    # servis_id -> je li zadnja provjera uspjela (za oznaku PROMJENA)
+verzija_rasporeda = 0                  # verzija posljednjeg primljenog rasporeda
 
 
-# --- Popis servisa ---------------------------------------------------------------
+# --- Raspored (od raspoređivača) ----------------------------------------------
 
-async def osvjezi_popis(klijent: httpx.AsyncClient) -> bool:
-    """Dohvati aktivne servise od konfiguracije. Vraća True ako je uspjelo."""
-    try:
-        odgovor = await klijent.get(
-            f"{KONFIGURACIJA_URL}/servisi", params={"aktivan": "true"}, timeout=3
-        )
-        odgovor.raise_for_status()
-        novi = {s["id"]: s for s in odgovor.json()}
-    except (httpx.HTTPError, ValueError) as e:
-        log.warning("Konfiguracija nedostupna (%s), nastavljam s posljednjim popisom (%d servisa)",
-                    type(e).__name__, len(servisi))
-        return False
-
-    if set(novi) != set(servisi):
-        log.info("Popis servisa: %s", ", ".join(sorted(novi)) or "(prazan)")
-    servisi.clear()
-    servisi.update(novi)
-    return True
-
-
-async def popis_petlja(klijent: httpx.AsyncClient, stop: asyncio.Event):
-    while not stop.is_set():
-        await osvjezi_popis(klijent)
+async def primi_raspored(poruka: aio_pika.abc.AbstractIncomingMessage):
+    global verzija_rasporeda
+    async with poruka.process():
         try:
-            await asyncio.wait_for(stop.wait(), timeout=OSVJEZI_S)
+            r = json.loads(poruka.body)
+            verzija = int(r["verzija"])
+            novi = {s["id"]: s for s in r["servisi"]}
+        except (ValueError, KeyError, TypeError):
+            log.warning("Neispravan raspored odbačen: %r", poruka.body[:200])
+            return
+
+        # Raspored koji stigne kasnije od novijeg se zanemaruje.
+        if verzija <= verzija_rasporeda:
+            return
+        verzija_rasporeda = verzija
+
+        if set(novi) != set(servisi):
+            log.info("Novi raspored: %s", ", ".join(sorted(novi)) or "(bez servisa)")
+        # Zaboravi servise koji više nisu naši
+        for sid in set(servisi) - set(novi):
+            zadnja_provjera.pop(sid, None)
+            zadnje_stanje.pop(sid, None)
+        servisi.clear()
+        servisi.update(novi)
+
+
+# --- Otkucaji -------------------------------------------------------------------
+
+async def otkucaji_petlja(kanal: aio_pika.abc.AbstractChannel, stop: asyncio.Event):
+    while not stop.is_set():
+        otkucaj = {
+            "sonda_id": SONDA_ID,
+            "lokacija": LOKACIJA,
+            "instanca": INSTANCA,
+            "vrijeme": datetime.now(timezone.utc).isoformat(),
+            "broj_servisa": len(servisi),
+        }
+        try:
+            await kanal.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(otkucaj).encode(),
+                    content_type="application/json",
+                    # Otkucaj stariji od 3 intervala nema smisla – ako ga
+                    # raspoređivač dotad ne pročita, RabbitMQ ga sam briše.
+                    expiration=OTKUCAJ_S * 3,
+                ),
+                routing_key=RED_OTKUCAJI,
+            )
+        except Exception as e:
+            log.error("Otkucaj nije poslan: %s", e)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=OTKUCAJ_S)
         except asyncio.TimeoutError:
             pass
 
@@ -176,16 +215,29 @@ async def main():
     red = await kanal.declare_queue(RED_PRIHVAT, durable=True)
     await red.bind(exchange)
 
+    # Otkucaji idu u zajednički red koji čita raspoređivač.
+    await kanal.declare_queue(RED_OTKUCAJI, durable=True)
+
+    # Vlastiti red za raspored. Čuva samo NAJNOVIJU poruku (x-max-length 1,
+    # starije se odbacuju): sondu zanima samo trenutni raspored. Red je
+    # trajan, pa ponovno pokrenuta sonda odmah dobije zadnji raspored.
+    raspored_exchange = await kanal.declare_exchange(
+        EXCHANGE_RASPORED, aio_pika.ExchangeType.DIRECT, durable=True
+    )
+    red_raspored = await kanal.declare_queue(
+        RED_RASPORED, durable=True,
+        arguments={"x-max-length": 1, "x-overflow": "drop-head"},
+    )
+    await red_raspored.bind(raspored_exchange, routing_key=SONDA_ID)
+    await red_raspored.consume(primi_raspored)
+
     async with httpx.AsyncClient(
         headers={"User-Agent": KORISNICKI_AGENT},
         follow_redirects=True,
     ) as klijent:
-        # Prvi popis: čekamo dok ga ne dobijemo (bez njega nemamo što provjeravati)
-        while not stop.is_set() and not await osvjezi_popis(klijent):
-            await asyncio.sleep(3)
-
-        log.info("Pokrenuta.")
-        zadaci = {asyncio.create_task(popis_petlja(klijent, stop))}
+        log.info("Pokrenuta, čekam raspored.")
+        # Red za raspored postoji prije prvog otkucaja, pa raspored ne može promašiti sondu.
+        zadaci = {asyncio.create_task(otkucaji_petlja(kanal, stop))}
 
         while not stop.is_set():
             sada = time.monotonic()

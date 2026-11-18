@@ -12,11 +12,21 @@ Radi_li/
 ├── .env.example         # predložak postavki (kopirati u .env)
 ├── testni-servis/       # lažni javni servis za testiranje (može se ugasiti/usporiti)
 ├── konfiguracija/       # vlasnik popisa servisa (REST, PostgreSQL)
+├── rasporedivac/        # prati otkucaje sondi i dodjeljuje servise sondama
 ├── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
 └── prihvat/             # čita rezultate iz reda i sprema ih u PostgreSQL
 ```
 
-Ostale komponente (raspoređivač, detektor ispada, API, sučelje) dodaju se korak po korak.
+Ostale komponente (detektor ispada, API, sučelje) dodaju se korak po korak.
+
+## Tko s kim razgovara
+
+| Veza | Način |
+| --- | --- |
+| Sonde → raspoređivač | red `otkucaji` (otkucaj svakih 10 s) |
+| Raspoređivač → sonde | direct exchange `raspored`, red `raspored.<sonda_id>` po sondi |
+| Raspoređivač → konfiguracija | REST `GET /servisi?aktivan=true` |
+| Sonde → prihvat | fanout exchange `rezultati`, red `rezultati.prihvat` |
 
 ## Usluga konfiguracije
 
@@ -24,16 +34,36 @@ Jedini pisac tablice `servisi`. Sučelje za isprobavanje: http://localhost:8301/
 
 | Zahtjev | Opis |
 | --- | --- |
-| `GET /servisi?aktivan=true` | popis servisa (ovo čitaju sonde) |
+| `GET /servisi?aktivan=true` | popis servisa (ovo čita raspoređivač) |
 | `PUT /servisi/{id}` | dodaje ili zamjenjuje servis (idempotentno) |
 | `PATCH /servisi/{id}` | djelomična izmjena, npr. `{"aktivan": false}` |
 | `DELETE /servisi/{id}` | briše servis (idempotentno) |
 
 Pravilo odgovornog praćenja: stvarni javni servisi (`testni: false`) imaju interval od najmanje 60 s, testni od najmanje 10 s. Pravilo provjeravaju i usluga i baza. Stvarni javni servisi (gov.hr, Studomat, Merlin, FIPU) upisani su kao isključeni dok ih operater ne uključi.
 
+## Raspoređivač
+
+Odlučuje koja sonda provjerava koji servis. Stanje sondi: http://localhost:8401/sonde, raspored: http://localhost:8401/raspored
+
+- Prati otkucaje sondi: bez otkucaja 15 s sonda **kasni**, nakon 30 s (3 propuštena otkucaja) je **ispala** i njezini servisi idu drugima.
+- Svaki servis dodjeljuje trima sondama, i to s **različitih lokacija** kad god je moguće, uz podjednako opterećenje. Pri promjeni mijenja što manje dodjela (stabilnost).
+- Svakoj sondi šalje **puni** popis njezinih servisa (idempotentna poruka), samo kad se promijeni i dodatno svakih 30 s.
+- Raspored sprema u tablicu `dodjele` (za kvorum u detektoru ispada), a stanje sondi u tablicu `sonde`.
+- Radi kao jedna instanca. Ako padne, sonde nastavljaju po posljednjem rasporedu; nakon ponovnog pokretanja čita stari raspored iz baze i pričeka 12 s da se sonde jave.
+
+Algoritam je u `rasporedivac/raspodjela.py` i ima vlastite testove (uključujući stotine nasumičnih scenarija ispada i dolazaka sondi):
+
+```
+docker compose run --rm --no-deps rasporedivac python test_raspodjela.py
+```
+
 ## Sonde
 
-Tri sonde (`sonda-a` Pula, `sonda-b` Rijeka, `sonda-c` Zagreb) svakih 15 s dohvaćaju popis aktivnih servisa od usluge konfiguracije, provjeravaju svaki servis prema njegovom intervalu i rezultate objavljuju na fanout exchange `rezultati`. Odatle idu u red `rezultati.prihvat`, iz kojega će čitati usluga za prihvat.
+Tri sonde (`sonda-a` Pula, `sonda-b` Rijeka, `sonda-c` Zagreb) svakih 10 s šalju otkucaj raspoređivaču, od njega primaju popis servisa, provjeravaju svaki servis prema njegovom intervalu i rezultate objavljuju na fanout exchange `rezultati`. Odatle idu u red `rezultati.prihvat`, iz kojega čita usluga za prihvat.
+
+Red `raspored.<sonda_id>` čuva samo najnoviji raspored (`x-max-length: 1`), pa ponovno pokrenuta sonda odmah dobije svoj posao. Ako raspoređivač ne radi, sonda nastavlja po posljednjem rasporedu.
+
+Četvrta sonda (`sonda-d`, Osijek) ne pokreće se sama, nego služi za demonstraciju dolaska nove sonde: `docker compose --profile dodatne up -d sonda-d`.
 
 Svaki rezultat je JSON poruka:
 
@@ -80,7 +110,7 @@ docker compose exec baza psql -U radili -c "SELECT sonda_id, servis_id, vrijeme,
 1. Kopiraj `.env.example` u `.env`.
 2. Pokreni:
    ```
-   docker compose up --build
+   docker compose up -d --build
    ```
 3. Provjeri:
    - RabbitMQ sučelje: http://localhost:15672 (korisnik i lozinka iz `.env`)
