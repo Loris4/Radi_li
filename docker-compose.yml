@@ -1,4 +1,4 @@
-# Radi li? – korak 5: + raspoređivač i otkucaji sondi
+# Radi li? – korak 6: + detektor ispada (kvorum 2 od 3, incidenti)
 #
 # Pokretanje:   docker compose up -d --build
 # Gašenje:      docker compose down
@@ -13,6 +13,10 @@ x-sonda: &sonda
   depends_on:
     rabbitmq:
       condition: service_healthy
+  # default = unutarnja mreža sustava (RabbitMQ); internet = mreža u kojoj su
+  # servisi koje provjeravamo. Odspajanjem sonde s mreže "internet" glumimo
+  # da njezina lokacija nema pristup internetu, a RabbitMQ joj i dalje radi.
+  networks: [default, internet]
   environment: &sonda-env
     RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
     # Popis servisa sonda dobiva od raspoređivača (kroz RabbitMQ).
@@ -41,6 +45,24 @@ services:
       ISPALA_S: "30"
     ports:
       - "8401:8000"
+
+  # Primjenjuje pravilo kvoruma, otvara i zatvara incidente.
+  # Stanje: http://localhost:8501/stanje   Incidenti: http://localhost:8501/incidenti
+  # Radi kao JEDNA instanca (mora vidjeti sve rezultate jednog servisa).
+  detektor:
+    build: ./detektor
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      baza:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@baza:5432/${POSTGRES_DB}
+      ISTEK_S: "5"
+    ports:
+      - "8501:8000"
 
   # Vlasnik popisa servisa. Sučelje za ručno isprobavanje: http://localhost:8301/docs
   konfiguracija:
@@ -145,6 +167,7 @@ services:
   # da ne opterećujemo prave javne servise.
   testni-egradani:
     build: ./testni-servis
+    networks: [internet]
     environment:
       IME_SERVISA: e-Građani (testni)
     ports:
@@ -152,6 +175,7 @@ services:
 
   testni-studomat:
     build: ./testni-servis
+    networks: [internet]
     environment:
       IME_SERVISA: Studomat (testni)
     ports:
@@ -159,10 +183,14 @@ services:
 
   testni-merlin:
     build: ./testni-servis
+    networks: [internet]
     environment:
       IME_SERVISA: Merlin (testni)
     ports:
       - "8103:8000"
+
+networks:
+  internet:
 
 volumes:
   rabbitmq_podaci:

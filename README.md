@@ -14,10 +14,11 @@ Radi_li/
 ├── konfiguracija/       # vlasnik popisa servisa (REST, PostgreSQL)
 ├── rasporedivac/        # prati otkucaje sondi i dodjeljuje servise sondama
 ├── sonda/               # provjerava servise i objavljuje rezultate u RabbitMQ
-└── prihvat/             # čita rezultate iz reda i sprema ih u PostgreSQL
+├── prihvat/             # čita rezultate iz reda i sprema ih u PostgreSQL
+└── detektor/            # kvorum 2 od 3, otvara i zatvara incidente
 ```
 
-Ostale komponente (detektor ispada, API, sučelje) dodaju se korak po korak.
+Ostale komponente (API, sučelje) dodaju se korak po korak.
 
 ## Tko s kim razgovara
 
@@ -27,6 +28,40 @@ Ostale komponente (detektor ispada, API, sučelje) dodaju se korak po korak.
 | Raspoređivač → sonde | direct exchange `raspored`, red `raspored.<sonda_id>` po sondi |
 | Raspoređivač → konfiguracija | REST `GET /servisi?aktivan=true` |
 | Sonde → prihvat | fanout exchange `rezultati`, red `rezultati.prihvat` |
+| Sonde → detektor | isti fanout exchange `rezultati`, vlastiti red `rezultati.detektor` (kopija svakog rezultata) |
+| Detektor → (buduće obavijesti) | fanout exchange `incidenti`, događaji `pocetak` i `kraj` |
+
+## Detektor ispada
+
+Odlučuje je li servis stvarno pao. Stanje: http://localhost:8501/stanje, incidenti: http://localhost:8501/incidenti, ručno zatvaranje: http://localhost:8501/docs
+
+**Pravilo kvoruma** (`detektor/kvorum.py`):
+
+- Svaka dodijeljena sonda glasa: `pao` ako su joj **dvije uzastopne** provjere neuspjele, `radi` ako su dvije uzastopne uspjele, inače `nesiguran`. Rezultati stariji od 3 intervala (+ istek) se ne broje (`nepoznato`).
+- **Kvorum je većina** dodijeljenih sondi (2 od 3). Stanje je `ne_radi` ako kvorum glasa `pao`, `radi` ako kvorum glasa `radi`, inače `nepoznato`.
+- Sonda koja glasa `pao` dok servis po kvorumu radi ima **lokalni problem** (npr. njezina mreža). Incident se ne otvara.
+
+**Incidenti:** otvaraju se kad stanje postane `ne_radi`, a zatvaraju kad postane `radi`. Početak i kraj su vremena prve neuspjele odnosno uspjele provjere u nizu, a ne trenutak odluke. Jedinstveni indeks u bazi jamči najviše jedan otvoren incident po servisu.
+
+- Detektor radi kao jedna instanca. Ako padne, rezultati čekaju u njegovom redu, a nakon ponovnog pokretanja zadnje rezultate i otvorene incidente učita iz baze.
+- Jedini je pisac tablica `stanje_servisa` i `incidenti`.
+
+Testovi pravila kvoruma:
+
+```
+docker compose run --rm --no-deps detektor python test_kvorum.py
+```
+
+### Simulacija lokalnog problema sonde
+
+Testni servisi su u zasebnoj Docker mreži `internet`, na koju su spojene samo sonde. Odspajanjem jedne sonde s te mreže glumi se da njezina lokacija nema pristup internetu, a veza s RabbitMQ-om joj i dalje radi:
+
+```
+docker network disconnect radi_li_internet radi_li-sonda-b-1
+docker network connect    radi_li_internet radi_li-sonda-b-1
+```
+
+Detektor tada javlja lokalni problem sonde-b, ali incident se ne otvara. (Točna imena mreže i kontejnera vide se naredbama `docker network ls` i `docker compose ps`.)
 
 ## Usluga konfiguracije
 
